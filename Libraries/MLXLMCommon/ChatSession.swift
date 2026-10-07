@@ -200,10 +200,11 @@ public final class ChatSession {
                 uncommittedTokens.removeAll()
             }
 
-            messages.append(
-                .assistant(
-                    assistant.content,
-                    toolCalls: assistant.toolCalls.isEmpty ? nil : assistant.toolCalls))
+            var message = Chat.Message.assistant(
+                assistant.content,
+                toolCalls: assistant.toolCalls.isEmpty ? nil : assistant.toolCalls)
+            message.prefilledReasoningStartDelimiter = assistant.prefilledReasoningStartDelimiter
+            messages.append(message)
             return true
         }
     }
@@ -218,6 +219,7 @@ public final class ChatSession {
     }
 
     private struct AssistantGeneration {
+        var prefilledReasoningStartDelimiter: String? = nil
         var content = ""
         var toolCalls: [ToolCall] = []
         var rejectedToolCalls: [RejectedToolCall] = []
@@ -244,6 +246,24 @@ public final class ChatSession {
             if let info = item.info {
                 stopReason = info.stopReason
             }
+        }
+    }
+
+    private static func prefilledReasoningStartDelimiter(
+        in promptTokens: [Int], config: ReasoningConfig?, tokenizer: any Tokenizer
+    ) -> String? {
+        guard let delimiter = config?.startDelimiter, !delimiter.isEmpty else { return nil }
+
+        // Decode a tail, expanding when trailing whitespace could hide the delimiter.
+        var count = min(64, promptTokens.count)
+        while true {
+            let tail = tokenizer.decode(
+                tokenIds: Array(promptTokens.suffix(count)), skipSpecialTokens: false
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            if tail.count >= delimiter.count || count == promptTokens.count {
+                return tail.hasSuffix(delimiter) ? delimiter : nil
+            }
+            count = min(promptTokens.count, count * 2)
         }
     }
 
@@ -1108,6 +1128,7 @@ public final class ChatSession {
                             tools: tools, additionalContext: additionalContext)
                         let preparedInput = try await processor.prepare(input: userInput)
                         var input = preparedInput
+                        var prefilledReasoningStartDelimiter: String?
                         pendingMessages.removeAll()
 
                         let speculativeMemoryEvaluation: SpeculativeDecodingMemoryEvaluation?
@@ -1138,7 +1159,11 @@ public final class ChatSession {
                             preparedInput.image != nil || preparedInput.video != nil
                             || preparedInput.audio != nil
                         if var currentConversation = conversation {
-                            let promptTokenIds = input.text.tokens.asArray(Int.self)
+                            let promptTokenIds = preparedInput.text.tokens.asArray(Int.self)
+                            prefilledReasoningStartDelimiter =
+                                ChatSession.prefilledReasoningStartDelimiter(
+                                    in: promptTokenIds, config: modelConfiguration.reasoningConfig,
+                                    tokenizer: tokenizer)
                             let cachedTokenIds = currentConversation.cachedTokens
                             assert(
                                 kvCache.nativeAttentionOffsetsAreAligned,
@@ -1449,7 +1474,8 @@ public final class ChatSession {
                         }
 
                         var pendingToolCalls: [ToolCall] = []
-                        var assistant = AssistantGeneration()
+                        var assistant = AssistantGeneration(
+                            prefilledReasoningStartDelimiter: prefilledReasoningStartDelimiter)
 
                         for await item in generation.stream {
                             let item = item.attributingCachedPromptTokens(cachedPromptTokenCount)
